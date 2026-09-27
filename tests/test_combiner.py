@@ -282,7 +282,7 @@ async def test_pipeline_happy_path():
         await run_review_pipeline("org", "repo", 1)
 
     mock_gh.post_pr_review.assert_called_once()
-    mock_gh.post_issue_comment.assert_called_once()
+    mock_gh.post_issue_comment.assert_not_called()  # removed duplicate post
 
 
 @pytest.mark.asyncio

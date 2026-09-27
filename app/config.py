@@ -20,8 +20,8 @@ class Settings(BaseSettings):
     watsonx_api_key: str
     watsonx_project_id: str
     watsonx_url: str = "https://us-south.ml.cloud.ibm.com"
-    watsonx_llm_model_id: str = "ibm/granite-3-8b-instruct"
-    watsonx_embed_model_id: str = "ibm/slate-125m-english-rtrvr"
+    watsonx_llm_model_id: str = "ibm/granite-4-h-small"
+    watsonx_embed_model_id: str = "ibm/granite-embedding-278m-multilingual"
 
     # PostgreSQL (pgvector)
     database_url: str

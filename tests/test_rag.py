@@ -36,6 +36,19 @@ def _make_pool(fetch_rows=None, execute_ok=True):
 @pytest.mark.asyncio
 async def test_embed_returns_vector():
     mock_client = MagicMock()
+    # v2 format: plain list of vectors
+    mock_client.embed_documents.return_value = [FAKE_VECTOR]
+    with patch("app.rag.store._get_embeddings_client", return_value=mock_client):
+        from app.rag.store import embed
+        result = await embed("some text")
+    assert result == FAKE_VECTOR
+    mock_client.embed_documents.assert_called_once_with(texts=["some text"])
+
+
+@pytest.mark.asyncio
+async def test_embed_returns_vector_v1_format():
+    """Also handles legacy v1 dict response format."""
+    mock_client = MagicMock()
     mock_client.embed_documents.return_value = {
         "results": [{"embedding": FAKE_VECTOR}]
     }
@@ -43,7 +56,6 @@ async def test_embed_returns_vector():
         from app.rag.store import embed
         result = await embed("some text")
     assert result == FAKE_VECTOR
-    mock_client.embed_documents.assert_called_once_with(texts=["some text"])
 
 
 # ---------------------------------------------------------------------------

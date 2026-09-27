@@ -95,8 +95,8 @@ async def run(diff: str, files: list[dict]) -> LensResult:
     2. Build a grounded prompt and call Granite.
     3. Parse structured findings.
     """
-    # Use a short summary of the diff as the RAG query
-    query = diff[:1500]
+    # Truncate to ~400 chars to stay within the embed model's 512-token limit
+    query = diff[:400]
     context_chunks = await search(query, top_k=RAG_TOP_K)
     logger.info("Regression lens: retrieved %d RAG chunks", len(context_chunks))
 

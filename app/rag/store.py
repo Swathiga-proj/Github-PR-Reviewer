@@ -1,6 +1,9 @@
 """
 RAG vector store — pgvector + watsonx.ai embeddings.
 
+# Note: ibm/slate-125m-english-rtrvr-v2 is deprecated but supported until Jan 2027.
+# Switch to ibm/granite-embedding-278m-multilingual when ready.
+
 Public API
 ----------
 embed(text)                             -> list[float]
@@ -74,10 +77,18 @@ async def embed(text: str) -> list[float]:
     Return the embedding vector for *text* using the configured watsonx.ai model.
     The call is synchronous inside the ibm-watsonx-ai SDK; we run it directly
     (FastAPI background tasks tolerate blocking calls at the task level).
+
+    ibm-watsonx-ai SDK response format varies by model version:
+      - v1 models: {"results": [{"embedding": [...]}]}
+      - v2 models: [[float, ...]]  (plain list of vectors)
+    We handle both.
     """
     client = _get_embeddings_client()
     response = client.embed_documents(texts=[text])
-    # ibm-watsonx-ai returns: {"results": [{"embedding": [...]}]}
+    if isinstance(response, list):
+        # v2 format: list of vectors, one per input text
+        return response[0]
+    # v1 format: dict with results key
     return response["results"][0]["embedding"]
 
 

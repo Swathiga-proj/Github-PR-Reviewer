@@ -172,15 +172,16 @@ async def run_review_pipeline(owner: str, repo: str, pull_number: int) -> None:
             logger.error("Failed to fetch PR data: %s", exc)
             return
 
-        # Step 2 — run three lenses in parallel
+        # Step 2 — run three lenses sequentially to respect Lite plan rate limits
+        # Switch back to asyncio.gather when on a paid watsonx.ai plan
+        results: list[LensResult] = []
         try:
-            results: list[LensResult] = list(
-                await asyncio.gather(
-                    regression_lens.run(diff, files),
-                    api_contract_lens.run(diff, files),
-                    backend_pitfall_lens.run(diff, files),
-                )
-            )
+            for coro in [
+                regression_lens.run(diff, files),
+                api_contract_lens.run(diff, files),
+                backend_pitfall_lens.run(diff, files),
+            ]:
+                results.append(await coro)
         except Exception as exc:
             logger.error("Lens execution failed: %s", exc)
             return
@@ -196,13 +197,25 @@ async def run_review_pipeline(owner: str, repo: str, pull_number: int) -> None:
             len(inline_comments),
         )
 
-        # Step 4 — post to GitHub
+        # Step 4 — post to GitHub as a PR review (single post, no duplicate issue comment)
+        # Try with inline comments first; fall back to body-only if positions are invalid.
         try:
             await gh.post_pr_review(
                 owner, repo, pull_number,
                 review_body=summary,
                 comments=inline_comments,
             )
-            await gh.post_issue_comment(owner, repo, pull_number, body=summary)
+            logger.info("Posted PR review with %d inline comments", len(inline_comments))
         except Exception as exc:
-            logger.error("Failed to post review to GitHub: %s", exc)
+            logger.warning(
+                "PR review with inline comments failed (%s) — retrying without inline comments", exc
+            )
+            try:
+                await gh.post_pr_review(
+                    owner, repo, pull_number,
+                    review_body=summary,
+                    comments=[],
+                )
+                logger.info("Posted PR review (no inline comments)")
+            except Exception as exc2:
+                logger.error("Failed to post PR review: %s", exc2)
