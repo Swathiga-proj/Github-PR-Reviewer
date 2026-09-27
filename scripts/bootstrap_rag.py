@@ -33,6 +33,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+import tiktoken  # pip install tiktoken
+
+# Granite doesn't publish a tiktoken-compatible tokenizer, but cl100k_base
+# gives a close-enough approximation for chunking purposes.
+_ENCODER = tiktoken.get_encoding("cl100k_base")
+
+def count_tokens(text: str) -> int:
+    return len(_ENCODER.encode(text))
 # ---------------------------------------------------------------------------
 # Chunking helpers
 # ---------------------------------------------------------------------------
@@ -40,7 +48,35 @@ logger = logging.getLogger(__name__)
 # Matches numbered section headings like "1. API Design Rules"
 _SECTION_RE = re.compile(r"^(\d+\.\s+.+)$", re.MULTILINE)
 
+MAX_TOKENS_PER_CHUNK = 300  # leave headroom under the 512 limit for title/filename text
 
+def split_patch_into_chunks(patch: str, max_tokens: int = MAX_TOKENS_PER_CHUNK) -> list[str]:
+    """Split a diff patch into chunks that fit under the embedding model's token limit."""
+    lines = patch.splitlines(keepends=True)
+    chunks: list[str] = []
+    current: list[str] = []
+    current_tokens = 0
+
+    for line in lines:
+        line_tokens = count_tokens(line)
+        if current_tokens + line_tokens > max_tokens and current:
+            chunks.append("".join(current))
+            current, current_tokens = [], 0
+        current.append(line)
+        current_tokens += line_tokens
+
+    if current:
+        chunks.append("".join(current))
+
+    return chunks
+def safe_chunk_text(doc_id_prefix: str, text: str, metadata: dict, max_tokens: int = MAX_TOKENS_PER_CHUNK) -> list[dict]:
+    if count_tokens(text) <= max_tokens:
+        return [{"doc_id": doc_id_prefix, "text": text, "metadata": metadata}]
+    pieces = split_patch_into_chunks(text, max_tokens=max_tokens)
+    return [
+        {"doc_id": f"{doc_id_prefix}:{i}", "text": p, "metadata": {**metadata, "part": i}}
+        for i, p in enumerate(pieces)
+    ]
 def chunk_rules(rules_path: Path) -> list[dict]:
     """
     Split PROJECT_RULES.md into one chunk per numbered section.
@@ -71,28 +107,92 @@ def chunk_rules(rules_path: Path) -> list[dict]:
     return chunks
 
 
-def chunk_pr(pr: dict, repo_full_name: str) -> dict:
-    """
-    Build a single chunk for a closed PR (title + body + diff summary).
-    The diff itself is not fetched here to keep bootstrap fast; only metadata
-    fields available in the list response are used.
-    """
+# def chunk_pr(pr: dict, repo_full_name: str) -> dict:
+#     """
+#     Build a single chunk for a closed PR (title + body + diff summary).
+#     The diff itself is not fetched here to keep bootstrap fast; only metadata
+#     fields available in the list response are used.
+#     """
+#     number = pr.get("number", 0)
+#     title = pr.get("title", "")
+#     body = (pr.get("body") or "").strip()
+#     text = f"PR #{number}: {title}\n\n{body}" if body else f"PR #{number}: {title}"
+#     return {
+#         "doc_id": f"pr:{repo_full_name}:{number}",
+#         "text": text,
+#         "metadata": {
+#             "source": "past_pr",
+#             "pr_number": number,
+#             "repo": repo_full_name,
+#             "state": pr.get("state", "closed"),
+#         },
+#     }
+async def chunk_pr_with_diff(
+    gh: GithubClient,
+    pr: dict,
+    repo_full_name: str,
+    owner: str,
+    repo: str,
+) -> list[dict]:
+    
     number = pr.get("number", 0)
     title = pr.get("title", "")
     body = (pr.get("body") or "").strip()
-    text = f"PR #{number}: {title}\n\n{body}" if body else f"PR #{number}: {title}"
-    return {
-        "doc_id": f"pr:{repo_full_name}:{number}",
-        "text": text,
-        "metadata": {
-            "source": "past_pr",
-            "pr_number": number,
-            "repo": repo_full_name,
-            "state": pr.get("state", "closed"),
-        },
+    base_meta = {
+        "source": "past_pr",
+        "pr_number": number,
+        "repo": repo_full_name,
+        "state": pr.get("state", "closed"),
     }
 
+    chunks = []
 
+    # 1. Summary chunk (title + body)
+    summary_text = f"PR #{number}: {title}\n\n{body}" if body else f"PR #{number}: {title}"
+    chunks.extend(
+        safe_chunk_text(
+            f"pr:{repo_full_name}:{number}:summary",
+            summary_text,
+            {**base_meta, "type": "summary"},
+        )
+    )
+
+    # 2. Fetch the actual files + patches
+    try:
+        files = await gh.get_pr_files(owner, repo, number)   
+    except Exception as e:
+        logger.warning("Could not fetch files for PR #%s: %s", number, e)
+        return chunks
+
+    for f in files:
+        filename = f.get("filename", "")
+        patch = f.get("patch") or ""
+        status = f.get("status", "")
+
+        if not filename.endswith(".py") or not patch:
+            continue
+
+        header = f"PR #{number}: {title}\nFile: {filename} ({status})\n\n"
+        header_tokens = count_tokens(header)
+        patch_chunks = split_patch_into_chunks(
+            patch, max_tokens=MAX_TOKENS_PER_CHUNK - header_tokens
+        )
+
+        for i, patch_piece in enumerate(patch_chunks):
+            text = header + patch_piece
+            chunks.append({
+                "doc_id": f"pr:{repo_full_name}:{number}:{filename}:{i}",
+                "text": text,
+                "metadata": {
+                    **base_meta,
+                    "type": "diff",
+                    "filename": filename,
+                    "status": status,
+                    "part": i,
+                    "total_parts": len(patch_chunks),
+                },
+            })
+        return chunks
 # ---------------------------------------------------------------------------
 # Main ingestion logic
 # ---------------------------------------------------------------------------
@@ -116,12 +216,16 @@ async def ingest(
     # --- 2. Past PRs ---------------------------------------------------------
     per_page = min(max_prs, 100)
     max_pages = max(1, -(-max_prs // per_page))  # ceiling division
+    repo_full = f"{github_owner}/{github_repo}"  # ← moved up, defined before use
+
     logger.info(
         "Fetching up to %d closed PRs from %s/%s…",
         max_prs,
         github_owner,
         github_repo,
     )
+
+    pr_chunk_count = 0
     async with GithubClient() as gh:
         prs = await gh.list_past_prs(
             github_owner, github_repo,
@@ -129,21 +233,21 @@ async def ingest(
             max_pages=max_pages,
         )
 
-    repo_full = f"{github_owner}/{github_repo}"
-    pr_chunks = [chunk_pr(pr, repo_full) for pr in prs[:max_prs]]
-    logger.info("Ingesting %d PR chunks…", len(pr_chunks))
-
-    for chunk in pr_chunks:
-        if dry_run:
-            logger.info("[dry-run] Would upsert %s: %s…", chunk["doc_id"], chunk["text"][:80])
-        else:
-            await upsert_document(chunk["doc_id"], chunk["text"], chunk["metadata"])
+        for pr in prs[:max_prs]:
+            chunks = await chunk_pr_with_diff(
+                gh, pr, repo_full, github_owner, github_repo
+            )
+            for chunk in chunks:
+                if dry_run:
+                    logger.info("[dry-run] %s → %s…", chunk["doc_id"], chunk["text"][:70])
+                else:
+                    await upsert_document(chunk["doc_id"], chunk["text"], chunk["metadata"])
+                pr_chunk_count += 1
 
     if not dry_run:
         await close_pool()
 
-    logger.info("Bootstrap complete. Rules: %d, PRs: %d", len(rule_chunks), len(pr_chunks))
-
+    logger.info("Bootstrap complete. Rules: %d, PR chunks: %d", len(rule_chunks), pr_chunk_count)
 
 # ---------------------------------------------------------------------------
 # CLI entry point
